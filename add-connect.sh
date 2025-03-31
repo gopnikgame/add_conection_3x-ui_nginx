@@ -28,30 +28,31 @@ get_port() {
     echo $(( ((RANDOM<<15)|RANDOM) % (max_port - min_port + 1) + min_port ))
 }
 
-# Проверка занятости порта
+# Проверка занятости порта (0 - свободен, 1 - занят)
 check_free() {
     local port=$1
     if ss -tuln | grep -q ":$port "; then
-        return 0  # порт занят
+        return 1  # порт занят
     else
-        return 1  # порт свободен
+        return 0  # порт свободен
     fi
 }
 
 # Генерация свободного порта
 make_port() {
+    local port
     while true; do
-        PORT=$(get_port)
-        if ! check_free $PORT; then 
-            echo $PORT
+        port=$(get_port)
+        if check_free $port; then 
+            echo $port
             break
         fi
     done
 }
 
 # Остановка сервисов перед изменениями
-systemctl stop x-ui || { echo "Ошибка: Не удалось остановить x-ui."; exit 1; }
-systemctl stop nginx || { echo "Ошибка: Не удалось остановить nginx."; exit 1; }
+systemctl stop x-ui || { echo "Предупреждение: Не удалось остановить x-ui."; }
+systemctl stop nginx || { echo "Предупреждение: Не удалось остановить nginx."; }
 
 # Генерация необходимых портов и путей
 sub_port=$(make_port)
@@ -62,44 +63,75 @@ panel_path=$(openssl rand -hex 6)
 ws_port=$(make_port)
 ws_path=$(openssl rand -hex 6)
 
-# Получение текущего домена из базы данных x-ui
 XUIDB="/etc/x-ui/x-ui.db"
+
+# Проверка наличия БД
 if [[ ! -f $XUIDB ]]; then
     echo "Ошибка: База данных x-ui не найдена."
     exit 1
 fi
 
-domain=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webDomain" LIMIT 1;' 2>&1)
-if [[ -z "$domain" ]]; then
-    echo "Ошибка: Домен не найден в базе данных x-ui."
+# Улучшенный запрос домена с обработкой разных случаев
+domain=$(sqlite3 -list "$XUIDB" <<EOF
+SELECT 
+  CASE 
+    WHEN json_extract(stream_settings, '$.externalProxy') IS NOT NULL 
+    THEN json_extract(
+           json_extract(stream_settings, '$.externalProxy'), 
+           '$[0].dest'
+         )
+    WHEN json_extract(stream_settings, '$.realitySettings.dest') IS NOT NULL
+    THEN substr(
+           json_extract(stream_settings, '$.realitySettings.dest'),
+           1,
+           instr(json_extract(stream_settings, '$.realitySettings.dest'), ':')-1
+    ELSE NULL
+  END
+FROM inbounds 
+WHERE protocol = 'vless'
+LIMIT 1;
+EOF
+)
+
+# Проверка результата
+if [[ -z "$domain" || "$domain" == "null" ]]; then
+    echo "Ошибка: Домен не найден в конфигурации x-ui."
     exit 1
 fi
+
+# Удаление возможного порта из домена
+domain=$(echo "$domain" | cut -d':' -f1)
+
+echo "Основной домен: $domain"
 
 # Получение Reality домена от пользователя
-read -p "Введите поддомен для Reality (sub.domain.tld): " reality_domain
-reality_domain=$(echo "$reality_domain" | tr -d '[:space:]')
+while true; do
+    read -p "Введите поддомен для Reality (sub.domain.tld): " reality_domain
+    reality_domain=$(echo "$reality_domain" | tr -d '[:space:]')
+    
+    # Проверка формата домена
+    if [[ "$reality_domain" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
+        break
+    else
+        echo "Ошибка: Введён некорректный домен. Пожалуйста, используйте формат sub.domain.tld."
+    fi
+done
 
-# Проверка формата домена
-if ! [[ "$reality_domain" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
-    echo "Ошибка: Введён некорректный домен. Пожалуйста, используйте формат sub.domain.tld."
-    exit 1
-fi
-
-# Генерация SSL сертификатов
+# Генерация SSL сертификатов с таймаутом
 echo "Получение сертификатов для доменов..."
-if ! certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain" -d "$reality_domain"; then
+if ! timeout 300 certbot certonly --standalone --non-interactive --agree-tos \
+    --register-unsafely-without-email -d "$domain" -d "$reality_domain"; then
     echo "Ошибка: Не удалось получить SSL-сертификаты через Certbot."
     exit 1
 fi
 
-if [[ ! -d "/etc/letsencrypt/live/${domain}/" ]]; then
-    echo "Ошибка: Не удалось получить SSL для $domain! Проверьте домен/IP или введите новый домен!"
-    exit 1
-fi
-if [[ ! -d "/etc/letsencrypt/live/${reality_domain}/" ]]; then
-    echo "Ошибка: Не удалось получить SSL для $reality_domain! Проверьте домен/IP или введите новый домен!"
-    exit 1
-fi
+# Проверка сертификатов
+for cert_domain in "$domain" "$reality_domain"; do
+    if [[ ! -f "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" ]]; then
+        echo "Ошибка: SSL сертификат для $cert_domain не найден!"
+        exit 1
+    fi
+done
 
 # Обновление 80.conf
 if [[ ! -f "/etc/nginx/sites-available/80.conf" ]]; then
@@ -128,24 +160,33 @@ unique_upstream="xray$(tr -dc A-Za-z </dev/urandom | head -c 6)"
 
 # Генерация случайного порта для нового серверного блока
 new_port=$(make_port)
+# Проверка что порт не используется в x-ui
+while sqlite3 -list "$XUIDB" "SELECT port FROM inbounds WHERE port = $new_port" | grep -q .; do
+    new_port=$(make_port)
+done
 
 # Генерация случайного имени пользователя и заметки
 username_random=$(openssl rand -hex 4)
 remark_random=$(openssl rand -hex 4)
+
 # Определение следующего доступного inbound_id
 inbound_id=1
-while sqlite3 -list $XUIDB "SELECT * FROM inbounds WHERE id = $inbound_id" 2>/dev/null | grep -q .; do
+while sqlite3 -list "$XUIDB" "SELECT id FROM inbounds WHERE id = $inbound_id" | grep -q .; do
     ((inbound_id++))
 done
 
 # Генерация short IDs (оптимизация)
-shor=($(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
+shor=()
+for i in {1..8}; do
+    shor+=("$(openssl rand -hex 8)")
+done
 
 # Обновление конфигурации nginx
 stream_conf="/etc/nginx/stream-enabled/stream.conf"
+mkdir -p "/etc/nginx/stream-enabled"
 
 # Проверка существования upstream
-if ! grep -q "^upstream $unique_upstream {" "$stream_conf"; then
+if ! grep -q "^upstream $unique_upstream {" "$stream_conf" 2>/dev/null; then
     cat >> "$stream_conf" << EOF
 upstream $unique_upstream {
     server 127.0.0.1:$new_port;
@@ -154,7 +195,7 @@ EOF
 fi
 
 # Добавление server block если его нет
-if ! grep -q "map \$ssl_preread_server_name \$sni_name {" "$stream_conf"; then
+if [[ ! -f "$stream_conf" ]] || ! grep -q "map \$ssl_preread_server_name \$sni_name {" "$stream_conf"; then
     cat > "$stream_conf" << EOF
 map \$ssl_preread_server_name \$sni_name {
     hostnames;
@@ -241,8 +282,9 @@ server {
     location / { try_files \$uri \$uri/ =444; }
 }
 EOF
+
 # Активация конфигурации сайта
-ln -sf "/etc/nginx/sites-available/${reality_domain}" "/etc/nginx/sites-enabled/"
+ln -sfn "/etc/nginx/sites-available/${reality_domain}" "/etc/nginx/sites-enabled/"
 
 # Проверка конфигурации nginx и перезапуск
 if ! nginx -t; then

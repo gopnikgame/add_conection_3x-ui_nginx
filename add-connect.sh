@@ -1,25 +1,34 @@
 #!/bin/bash
 set -euo pipefail
 
+# Логирование действий в файл
+LOG_FILE="/var/log/reality_setup.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "=== Начало установки ==="
+
 # Проверка прав root
 if [[ $EUID -ne 0 ]]; then
-   echo "Этот скрипт должен быть запущен с правами root" 
+   echo "Ошибка: Этот скрипт должен быть запущен с правами root."
    exit 1
 fi
 
 # Проверка зависимостей
 for cmd in sqlite3 nginx certbot openssl; do
     if ! command -v $cmd &> /dev/null; then
-        echo "Ошибка: $cmd не установлен"
+        echo "Ошибка: Команда '$cmd' не установлена. Установите её перед использованием скрипта."
         exit 1
     fi
 done
 
-# Функция для генерации случайного порта
+# Функция для генерации случайного порта (с проверкой минимального значения)
 get_port() {
-    echo $(( ((RANDOM<<15)|RANDOM) % 49152 + 10000 ))
+    local min_port=1025
+    local max_port=65535
+    echo $(( ((RANDOM<<15)|RANDOM) % (max_port - min_port + 1) + min_port ))
 }
 
+# Проверка занятости порта
 check_free() {
     local port=$1
     if ss -tuln | grep -q ":$port "; then
@@ -29,6 +38,7 @@ check_free() {
     fi
 }
 
+# Генерация свободного порта
 make_port() {
     while true; do
         PORT=$(get_port)
@@ -40,8 +50,8 @@ make_port() {
 }
 
 # Остановка сервисов перед изменениями
-systemctl stop x-ui
-systemctl stop nginx
+systemctl stop x-ui || { echo "Ошибка: Не удалось остановить x-ui."; exit 1; }
+systemctl stop nginx || { echo "Ошибка: Не удалось остановить nginx."; exit 1; }
 
 # Генерация необходимых портов и путей
 sub_port=$(make_port)
@@ -55,13 +65,13 @@ ws_path=$(openssl rand -hex 6)
 # Получение текущего домена из базы данных x-ui
 XUIDB="/etc/x-ui/x-ui.db"
 if [[ ! -f $XUIDB ]]; then
-    echo "База данных x-ui не найдена."
+    echo "Ошибка: База данных x-ui не найдена."
     exit 1
 fi
 
 domain=$(sqlite3 -list $XUIDB 'SELECT "value" FROM settings WHERE "key"="webDomain" LIMIT 1;' 2>&1)
 if [[ -z "$domain" ]]; then
-    echo "Домен не найден в базе данных x-ui."
+    echo "Ошибка: Домен не найден в базе данных x-ui."
     exit 1
 fi
 
@@ -69,17 +79,25 @@ fi
 read -p "Введите поддомен для Reality (sub.domain.tld): " reality_domain
 reality_domain=$(echo "$reality_domain" | tr -d '[:space:]')
 
-# Генерация SSL сертификатов
-echo "Получение сертификатов для доменов..."
-certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain" -d "$reality_domain"
-
-if [[ ! -d "/etc/letsencrypt/live/${domain}/" ]]; then
-    echo "Не удалось получить SSL для $domain! Проверьте домен/IP или введите новый домен!"
+# Проверка формата домена
+if ! [[ "$reality_domain" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
+    echo "Ошибка: Введён некорректный домен. Пожалуйста, используйте формат sub.domain.tld."
     exit 1
 fi
 
+# Генерация SSL сертификатов
+echo "Получение сертификатов для доменов..."
+if ! certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain" -d "$reality_domain"; then
+    echo "Ошибка: Не удалось получить SSL-сертификаты через Certbot."
+    exit 1
+fi
+
+if [[ ! -d "/etc/letsencrypt/live/${domain}/" ]]; then
+    echo "Ошибка: Не удалось получить SSL для $domain! Проверьте домен/IP или введите новый домен!"
+    exit 1
+fi
 if [[ ! -d "/etc/letsencrypt/live/${reality_domain}/" ]]; then
-    echo "Не удалось получить SSL для $reality_domain! Проверьте домен/IP или введите новый домен!"
+    echo "Ошибка: Не удалось получить SSL для $reality_domain! Проверьте домен/IP или введите новый домен!"
     exit 1
 fi
 
@@ -114,14 +132,13 @@ new_port=$(make_port)
 # Генерация случайного имени пользователя и заметки
 username_random=$(openssl rand -hex 4)
 remark_random=$(openssl rand -hex 4)
-
 # Определение следующего доступного inbound_id
 inbound_id=1
 while sqlite3 -list $XUIDB "SELECT * FROM inbounds WHERE id = $inbound_id" 2>/dev/null | grep -q .; do
     ((inbound_id++))
 done
 
-# Генерация short IDs
+# Генерация short IDs (оптимизация)
 shor=($(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8) $(openssl rand -hex 8))
 
 # Обновление конфигурации nginx
@@ -130,7 +147,6 @@ stream_conf="/etc/nginx/stream-enabled/stream.conf"
 # Проверка существования upstream
 if ! grep -q "^upstream $unique_upstream {" "$stream_conf"; then
     cat >> "$stream_conf" << EOF
-
 upstream $unique_upstream {
     server 127.0.0.1:$new_port;
 }
@@ -172,7 +188,6 @@ server {
     if (\$request_uri ~ "(\"|'|\`|~|,|:|--|;|%|\\$|&&|\?\?|0x00|0X00|\||\\|\{|\}|\[|\]|<|>|\.\.\.|\.\.\/|\/\/\/)"){set \$hack 1;}
     error_page 400 401 402 403 500 501 502 503 504 =404 /404;
     proxy_intercept_errors on;
-    
     # X-UI Admin Panel
     location /${panel_path}/ {
         proxy_redirect off;
@@ -182,10 +197,9 @@ server {
         proxy_pass http://127.0.0.1:${panel_port};
         break;
     }
-    
     # Subscription Paths
     location /${sub_path} {
-        if (\$hack = 1) {return 404;}
+        if (\$hack = 1) {return 444;}
         proxy_redirect off;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -193,9 +207,8 @@ server {
         proxy_pass http://127.0.0.1:${sub_port};
         break;
     }
-    
     location /${json_path} {
-        if (\$hack = 1) {return 404;}
+        if (\$hack = 1) {return 444;}
         proxy_redirect off;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -203,10 +216,9 @@ server {
         proxy_pass http://127.0.0.1:${sub_port};
         break;
     }
-    
     # Xray Config Path
     location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)\$ {
-        if (\$hack = 1) {return 404;}
+        if (\$hack = 1) {return 444;}
         client_max_body_size 0;
         client_body_timeout 1d;
         grpc_read_timeout 1d;
@@ -226,11 +238,9 @@ server {
             break;
         }
     }
-    
-    location / { try_files \$uri \$uri/ =404; }
+    location / { try_files \$uri \$uri/ =444; }
 }
 EOF
-
 # Активация конфигурации сайта
 ln -sf "/etc/nginx/sites-available/${reality_domain}" "/etc/nginx/sites-enabled/"
 
@@ -239,8 +249,7 @@ if ! nginx -t; then
     echo "Ошибка в конфигурации nginx!"
     exit 1
 fi
-
-systemctl restart nginx
+systemctl restart nginx || { echo "Ошибка: Не удалось перезапустить nginx."; exit 1; }
 
 # Генерация новых клиентских ID и ключей
 var1=$(/usr/local/x-ui/bin/xray-linux-amd64 x25519)
@@ -348,8 +357,9 @@ INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_
 EOF
 
 # Запуск x-ui
-systemctl start x-ui
+systemctl start x-ui || { echo "Ошибка: Не удалось запустить x-ui."; exit 1; }
 
+echo "=== Установка завершена ==="
 echo "Новое Reality подключение успешно добавлено с заметкой: reality_${remark_random}"
 echo "Данные для подключения:"
 echo "Адрес: ${reality_domain}"
